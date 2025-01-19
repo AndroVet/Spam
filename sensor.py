@@ -22,7 +22,6 @@ import binascii
 import socket
 import datetime
 import logging
-import asyncio
 import traceback
 import json
 import threading
@@ -36,11 +35,8 @@ from homeassistant.const import (CONF_IP_ADDRESS, CONF_MAC, CONF_TIMEOUT, STATE_
     EVENT_HOMEASSISTANT_STOP, STATE_ALARM_DISARMED, STATE_ALARM_ARMED_HOME, STATE_ALARM_ARMED_AWAY)
 from homeassistant.util.dt import now
 
-"""current broadlink moudle in ha is of version 0.5 which doesn't supports s1c hubs, usuing version 0.6 from github"""
-# REQUIREMENTS = ['https://github.com/mjg59/python-broadlink/archive/master.zip#broadlink==0.6']
-"""one of the broadlink 0.6 requirements is the pycrypto library which is blocked ever since HA 0.64.0, my forked repository of python-broadlink is working with its replacement pycryptodome"""
-# REQUIREMENTS = ['https://github.com/TomerFi/python-broadlink/archive/master.zip#broadlink==0.6']
-"""home assistant 0.67.1 is using broadlink 0.8 so there is no need for special requirements"""
+from broadlink import S1C
+
 REQUIREMENTS = []
 
 _LOGGER = logging.getLogger(__name__)
@@ -78,8 +74,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
 })
 
 """set up broadlink s1c platform"""
-@asyncio.coroutine
-def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
+async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
 
     _LOGGER.debug("starting platform setup")
 
@@ -149,36 +144,34 @@ class S1C_SENSOR(Entity):
 
 
     @property
-    def device_state_attributes(self):
+    def extra_state_attributes(self):
         """sensor state attributes"""
         return {
             "sensor_type": self._sensor_type,
             "last_changed": self._last_changed
         }
 
-    @asyncio.coroutine
-    def async_event_listener(self, event):
+    async def async_event_listener(self, event):
         """handling incoming events and update ha state"""
         if (event.data.get(EVENT_PROPERTY_NAME) == self._name):
             _LOGGER.debug(self._name + " received " + UPDATE_EVENT)
             self._state = event.data.get(EVENT_PROPERTY_STATE)
             self._last_changed = event.time_fired
-            yield from self.async_update_ha_state()
+            await self.async_write_ha_state()
 
 
 class HubConnection(object):
     """s1c hub connection and utility class"""
     def __init__(self, ip_addr, mac_addr, timeout):
         """initialize the connection object"""
-        import broadlink
-        self._hub = broadlink.S1C((ip_addr, 80), mac_addr, None)
+        self._hub = S1C((ip_addr, 80), mac_addr, 0x2714)
         self._hub.timeout = timeout
         self._authorized = self.authorize()
         if (self._authorized):
             _LOGGER.info("succesfully connected to s1c hub")
             self._initial_data = self._hub.get_sensors_status()
         else:
-            _LOGGER.error("failed to connect s1c hub, not authorized. please fix the problem and restart the system")
+            _LOGGER.error("failed to connect s1c or s2c hub, not authorized. please fix the problem and restart the system")
             self._initial_data = None
 
     def authorize(self, retry=3):
@@ -207,9 +200,9 @@ class HubConnection(object):
             return STATE_OPEN
         elif sensor_type == SENSOR_TYPE_DOOR_SENSOR and sensor_status == "48":
             return STATE_TAMPERED
-        elif sensor_type == SENSOR_TYPE_MOTION_SENSOR and sensor_status in ("0", "128"):
+        elif sensor_type == SENSOR_TYPE_MOTION_SENSOR and sensor_status in ("0", "64", "128"):
             return STATE_NO_MOTION
-        elif sensor_type == SENSOR_TYPE_MOTION_SENSOR and sensor_status == "16":
+        elif sensor_type == SENSOR_TYPE_MOTION_SENSOR and sensor_status in ("16", "80"):
             return STATE_MOTION_DETECTED
         elif sensor_type == SENSOR_TYPE_MOTION_SENSOR and sensor_status == "32":
             return STATE_TAMPERED
@@ -259,7 +252,11 @@ class WatchSensors(threading.Thread):
                 current_status = self._hub.get_sensors_status()
                 for i, sensor in enumerate(current_status["sensors"]):
                     current_fixed_status = self._conn_obj.parse_status(sensor["type"], str(sensor["status"]))
-                    previous_fixed_status = self._conn_obj.parse_status(old_status["sensors"][i]["type"], str(old_status["sensors"][i]["status"]))
+                    if old_status.get("sensors") is not None and len(old_status.get("sensors")) >= i and \
+                            old_status.get("sensors")[i].get("status") is not None:
+                        previous_fixed_status = self._conn_obj.parse_status(old_status["sensors"][i]["type"], str(old_status["sensors"][i]["status"]))
+                    else:
+                        previous_fixed_status = STATE_CLOSED
                     if not (current_fixed_status == previous_fixed_status):
                         _LOGGER.debug("status change tracked from: " + json.dumps(old_status["sensors"][i]))
                         _LOGGER.debug("status change tracked to: " + json.dumps(sensor))
@@ -273,7 +270,7 @@ class WatchSensors(threading.Thread):
 
     def check_loop_run(self):
         """max exceptions allowed in loop before exiting"""
-        max_exceptions_before_stop = 50
+        max_exceptions_before_stop = 500
         """max minutes to remmember the last excption"""
         max_minutes_from_last_exception = 1
         
